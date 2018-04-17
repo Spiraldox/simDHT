@@ -9,13 +9,14 @@ from socket import inet_ntoa
 from threading import Timer, Thread
 from time import sleep
 from collections import deque
+import logging
 
-from bencode import bencode, bdecode
+from torrent.BEncoding import BEncoding_decode, BEncoding_encode
 
 BOOTSTRAP_NODES = (
     ("router.bittorrent.com", 6881),
     ("dht.transmissionbt.com", 6881),
-    ("router.utorrent.com", 6881)
+    ("router.utorrent.com", 6881),
 )
 TID_LENGTH = 2
 RE_JOIN_DHT_INTERVAL = 3
@@ -23,12 +24,12 @@ TOKEN_LENGTH = 2
 
 
 def entropy(length):
-    return "".join(chr(randint(0, 255)) for _ in xrange(length))
+    return "".join(chr(randint(0, 255)) for _ in range(length))
 
 
 def random_id():
     h = sha1()
-    h.update(entropy(20))
+    h.update(entropy(20).encode())
     return h.digest()
 
 
@@ -73,10 +74,11 @@ class DHTClient(Thread):
         self.nodes = deque(maxlen=max_node_qsize)
 
     def send_krpc(self, msg, address):
-        try:
-            self.ufd.sendto(bencode(msg), address)
-        except Exception:
-            pass
+        #try:
+        self.ufd.sendto(BEncoding_encode(msg), address)
+        #except Exception as e:
+        #    logging.warning("send data to {} failed, exception is {}".format(address, e))
+        #    pass
 
     def send_find_node(self, address, nid=None):
         nid = get_neighbor(nid, self.nid) if nid else self.nid
@@ -104,11 +106,13 @@ class DHTClient(Thread):
     def auto_send_find_node(self):
         wait = 1.0 / self.max_node_qsize
         while True:
-            try:
+           #try:
+            if len(self.nodes) > 0:
+                #print("auto_send_find_node: send find node")
                 node = self.nodes.popleft()
                 self.send_find_node((node.ip, node.port), node.nid)
-            except IndexError:
-                pass
+            #except IndexError:
+            #    pass
             sleep(wait)
 
     def process_find_node_response(self, msg, address):
@@ -119,6 +123,7 @@ class DHTClient(Thread):
             if ip == self.bind_ip: continue
             if port < 1 or port > 65535: continue
             n = KNode(nid, ip, port)
+            print("find node: {}".format((nid, ip, port)))
             self.nodes.append(n)
 
 
@@ -145,103 +150,111 @@ class DHTServer(DHTClient):
     def run(self):
         self.re_join_DHT()
         while True:
-            try:
-                (data, address) = self.ufd.recvfrom(65536)
-                msg = bdecode(data)
-                self.on_message(msg, address)
-            except Exception:
-                pass
+            #try:
+            (data, address) = self.ufd.recvfrom(65536)
+
+            msg = BEncoding_decode(data)
+            self.on_message(msg, address)
+            #except Exception:
+            #    pass
 
     def on_message(self, msg, address):
-        try:
-            if msg["y"] == "r":
-                if msg["r"].has_key("nodes"):
-                    self.process_find_node_response(msg, address)
-            elif msg["y"] == "q":
-                try:
-                    self.process_request_actions[msg["q"]](msg, address)
-                except KeyError:
-                    self.play_dead(msg, address)
-        except KeyError:
-            pass
+        #try:
+        if msg is None:
+            return
+        if msg["y"] == b"r":
+            print("Responses message from {}".format(address))
+            if "nodes" in msg["r"]:
+                self.process_find_node_response(msg, address)
+        elif msg["y"] == b"q":
+            print("Query message from {}".format(address))
+            try:
+                self.process_request_actions[msg["q"]](msg, address)
+            except KeyError:
+                self.play_dead(msg, address)
+        elif msg["y"] == b"e":
+            print("Error message from {}, error code is {}".format(address, msg["e"]))
+
+        #except KeyError:
+        #    pass
 
     def on_get_peers_request(self, msg, address):
-        try:
-            infohash = msg["a"]["info_hash"]
-            tid = msg["t"]
-            nid = msg["a"]["id"]
-            token = infohash[:TOKEN_LENGTH]
-            msg = {
-                "t": tid,
-                "y": "r",
-                "r": {
-                    "id": get_neighbor(infohash, self.nid),
-                    "nodes": "",
-                    "token": token
-                }
+        #try:
+        infohash = msg["a"]["info_hash"]
+        tid = msg["t"]
+        nid = msg["a"]["id"]
+        token = infohash[:TOKEN_LENGTH]
+        msg = {
+            "t": tid,
+            "y": "r",
+            "r": {
+                "id": get_neighbor(infohash, self.nid),
+                "nodes": "",
+                "token": token
             }
-            self.send_krpc(msg, address)
-        except KeyError:
-            pass
+        }
+        self.send_krpc(msg, address)
+        #except KeyError:
+        #    pass
 
     def on_announce_peer_request(self, msg, address):
-        try:
-            infohash = msg["a"]["info_hash"]
-            token = msg["a"]["token"]
-            nid = msg["a"]["id"]
-            tid = msg["t"]
+        #try:
+        infohash = msg["a"]["info_hash"]
+        token = msg["a"]["token"]
+        nid = msg["a"]["id"]
+        tid = msg["t"]
 
-            if infohash[:TOKEN_LENGTH] == token:
-                if msg["a"].has_key("implied_port") and msg["a"]["implied_port"] != 0:
-                    port = address[1]
-                else:
-                    port = msg["a"]["port"]
-                    if port < 1 or port > 65535: return
-                self.master.log(infohash, (address[0], port))
-        except Exception:
-            pass
-        finally:
-            self.ok(msg, address)
+        if infohash[:TOKEN_LENGTH] == token:
+            if msg["a"].has_key("implied_port") and msg["a"]["implied_port"] != 0:
+                port = address[1]
+            else:
+                port = msg["a"]["port"]
+                if port < 1 or port > 65535: return
+            self.master.log(infohash, (address[0], port))
+        #except Exception:
+        #    pass
+        #finally:
+        self.ok(msg, address)
 
     def play_dead(self, msg, address):
-        try:
-            tid = msg["t"]
-            msg = {
-                "t": tid,
-                "y": "e",
-                "e": [202, "Server Error"]
-            }
-            self.send_krpc(msg, address)
-        except KeyError:
-            pass
+        #try:
+        tid = msg["t"]
+        msg = {
+            "t": tid,
+            "y": "e",
+            "e": [202, "Server Error"]
+        }
+        self.send_krpc(msg, address)
+        #except KeyError:
+        #    pass
 
     def ok(self, msg, address):
-        try:
-            tid = msg["t"]
-            nid = msg["a"]["id"]
-            msg = {
-                "t": tid,
-                "y": "r",
-                "r": {
-                    "id": get_neighbor(nid, self.nid)
-                }
+        #try:
+        tid = msg["t"]
+        nid = msg["a"]["id"]
+        msg = {
+            "t": tid,
+            "y": "r",
+            "r": {
+                "id": get_neighbor(nid, self.nid)
             }
-            self.send_krpc(msg, address)
-        except KeyError:
-            pass
+        }
+        self.send_krpc(msg, address)
+        #except KeyError:
+        #    pass
 
 
 class Master(object):
 
     def log(self, infohash, address=None):
-        print "%s from %s:%s" % (
+        print( "%s from %s:%s" % (
             infohash.encode("hex"), address[0], address[1]
-        )
+        ))
 
 
 # using example
 if __name__ == "__main__":
     # max_node_qsize bigger, bandwith bigger, speed higher
-    dht = DHTServer(Master(), "0.0.0.0", 6882, max_node_qsize=200)
+    dht = DHTServer(Master(), "202.114.6.12", 6895, max_node_qsize=200)
     dht.start()
     dht.auto_send_find_node()
